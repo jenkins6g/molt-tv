@@ -2,12 +2,14 @@
 
 require('dotenv').config({ path: require('path').join(__dirname, '../../.env') });
 
-const { app, BrowserWindow, ipcMain, desktopCapturer, session } = require('electron');
+const { app, BrowserWindow, ipcMain, session, desktopCapturer } = require('electron');
 const path = require('path');
 const { createDailyRoom } = require('./daily-api');
 
 // Required for Electron's desktopCapturer to work with getUserMedia in renderer
 app.commandLine.appendSwitch('enable-features', 'ElectronDesktopCapturer');
+
+let mainWindow = null;
 
 function createWindow() {
   // Allow media permissions so renderer can call getUserMedia with chromeMediaSource
@@ -31,6 +33,7 @@ function createWindow() {
     },
   });
 
+  mainWindow = win;
   win.loadFile(path.join(__dirname, '../renderer/index.html'));
 
   if (process.env.NODE_ENV === 'development') {
@@ -44,6 +47,10 @@ ipcMain.handle('create-room', async () => {
   return createDailyRoom(apiKey);
 });
 
+ipcMain.handle('minimize-window', () => {
+  if (mainWindow) mainWindow.minimize();
+});
+
 ipcMain.handle('get-sources', async () => {
   const sources = await desktopCapturer.getSources({
     types: ['screen'],
@@ -55,6 +62,7 @@ ipcMain.handle('get-sources', async () => {
     thumbnailDataUrl: s.thumbnail.toDataURL(),
   }));
 });
+
 
 app.whenReady().then(() => {
   createWindow();
