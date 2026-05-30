@@ -1,0 +1,16 @@
+{
+  "name": "molt-tv",
+  "version": "1.0.0",
+  "description": "Screen streaming broadcaster via Daily.co",
+  "main": "src/main/index.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "ELECTRON_ENABLE_LOGGING=1 electron . --inspect=9229"
+  },
+  "dependencies": {
+    "dotenv": "^16.0.0"
+  },
+  "devDependencies": {
+    "electron": "^30.0.0"
+  }
+}
