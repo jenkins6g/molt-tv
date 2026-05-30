@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from loguru import logger
 from openai import AsyncOpenAI
 from pipecat.frames.frames import (
+    LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMMessagesAppendFrame,
     TextFrame,
@@ -76,10 +77,12 @@ class EmotionExtractor(FrameProcessor):
         if direction != FrameDirection.DOWNSTREAM:
             await self.push_frame(frame, direction)
             return
+
         if isinstance(frame, LLMFullResponseStartFrame):
             self._buffer = ""
             self._found = False
             await self.push_frame(frame, direction)
+
         elif isinstance(frame, TextFrame) and not self._found:
             self._buffer += frame.text
             m = EMOTION_RE.search(self._buffer)
@@ -89,9 +92,21 @@ class EmotionExtractor(FrameProcessor):
                 speed = float(m.group(2)) if m.group(2) else 1.0
                 self._tts._settings.generation_config = GenerationConfig(emotion=emotion, speed=speed)
                 logger.info(f"[EMOTION] {emotion} speed={speed}")
-                remainder = self._buffer[m.end():].lstrip()
-                if remainder:
-                    await self.push_frame(TextFrame(text=remainder), direction)
+                # Push text before AND after the tag so nothing is swallowed
+                before = self._buffer[:m.start()].strip()
+                after = self._buffer[m.end():].lstrip()
+                text_out = (before + " " + after).strip() if before else after
+                if text_out:
+                    await self.push_frame(TextFrame(text=text_out), direction)
+            # else: keep buffering until tag found or response ends
+
+        elif isinstance(frame, LLMFullResponseEndFrame):
+            # Response ended with no emotion tag — flush buffered text as-is
+            if not self._found and self._buffer.strip():
+                logger.debug("[EMOTION] no tag found, flushing buffer to TTS")
+                await self.push_frame(TextFrame(text=self._buffer.strip()), direction)
+            await self.push_frame(frame, direction)
+
         else:
             await self.push_frame(frame, direction)
 
@@ -234,7 +249,7 @@ class HarnessWorker(LLMWorker):
 
     # ── Multiworker tool: harness → game subagent ──────────────────────────────
 
-    @tool(cancel_on_interruption=False, timeout=60)
+    @tool(cancel_on_interruption=True, timeout=60)
     async def play_game(self, params: FunctionCallParams, action: str):
         """Delegate a game action to the game execution subagent. Call this after announcing the action out loud.
 
