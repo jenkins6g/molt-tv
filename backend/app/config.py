@@ -29,6 +29,7 @@ class Settings:
 
     cekura_api_key: str
     cekura_base_url: str
+    cekura_agent_id: str
 
     sqlite_path: str
     faiss_path: str
@@ -54,6 +55,7 @@ def load() -> Settings:
         twilio_auth_token=g("TWILIO_AUTH_TOKEN", ""),
         cekura_api_key=g("CEKURA_API_KEY", ""),
         cekura_base_url=g("CEKURA_BASE_URL", "https://api.cekura.ai"),
+        cekura_agent_id=g("CEKURA_AGENT_ID", ""),
         sqlite_path=g("SQLITE_PATH", "./data/civicpilot.db"),
         faiss_path=g("FAISS_PATH", "./data/failures.faiss"),
         phase=int(g("PHASE", "1")),

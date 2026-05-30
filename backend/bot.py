@@ -341,22 +341,10 @@ async def run_session(
             pass
         if os.environ.get("CEKURA_OBSERVABILITY_ENABLED", "true").lower() != "false":
             try:
-                full_transcript = store.recent_transcript(
-                    since=0.0, limit=10000, session_id=session_id
-                )
-                chat_decisions = store.recent_chat_decisions(limit=200)
-                ok = await asyncio.wait_for(
-                    cekura_client.push_observability(
-                        call_id=session_id,
-                        transcript=full_transcript,
-                        chat_decisions=chat_decisions,
-                        metadata={"audio_mode": audio_mode, "room_url": room_url},
-                    ),
-                    timeout=5.0,
-                )
-                logger.info(f"[CEKURA] observability dump {'ok' if ok else 'failed'}")
+                ok = await asyncio.wait_for(beat_ticker.final_flush(), timeout=5.0)
+                logger.info(f"[CEKURA] final observe {'ok' if ok else 'skipped/failed'}")
             except (asyncio.TimeoutError, Exception) as e:
-                logger.warning(f"[CEKURA] observability dump error: {e}")
+                logger.warning(f"[CEKURA] final observe error: {e}")
         try:
             await cekura_client.close()
         except Exception:
