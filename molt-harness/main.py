@@ -1,15 +1,19 @@
 """molt-harness/main.py — Orchestrates GB game session + screenshare + voice co-host."""
 
+import argparse
 import asyncio
 import os
 import subprocess
 from pathlib import Path
+from typing import Optional
 
 import httpx
 from dotenv import load_dotenv
 from loguru import logger
+from openai import AsyncOpenAI
 from playwright.async_api import async_playwright
 
+from agenda import AgendaScheduler, interpret_agenda
 from bot import run_bot
 
 # Root .env has GB credentials + shared API keys; local .env can override.
@@ -20,7 +24,9 @@ load_dotenv(override=True)
 DAILY_API_KEY = os.environ["DAILY_API_KEY"]
 BROADCAST_DIR = Path(__file__).parent.parent / "molt-broadcast"
 BACKEND_DIR = Path(__file__).parent.parent / "backend"
+HARNESS_DIR = Path(__file__).parent
 CDP_PORT = 9222
+DEFAULT_AGENDA = HARNESS_DIR / "agenda.md"
 
 
 async def get_electron_path() -> str:
@@ -123,7 +129,7 @@ async def launch_game_browser(playwright, email: str, password: str):
 
     # --- Step 2 + 3: Wait for character select screen, then click the character ---
     # The card DOM: <div role="button" aria-label="Select character MoltStreamer, last active ...">
-    character_name = os.environ.get("GB_CHARACTER", "MoltStreamer")
+    character_name = os.environ.get("GB_CHARACTER", "MoltStreamerv2")
 
     async def hover_then_click(locator):
         """Move mouse to element once and click at the same coords — avoids re-computing
@@ -189,6 +195,32 @@ def launch_backend_bot() -> subprocess.Popen:
 
 
 async def main() -> None:
+    parser = argparse.ArgumentParser(description="molt-tv harness")
+    parser.add_argument(
+        "--agenda",
+        type=Path,
+        default=None,
+        help="Path to agenda markdown file (default: molt-harness/agenda.md if it exists)",
+    )
+    args, _ = parser.parse_known_args()
+
+    openai_client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+    agenda_scheduler: Optional[AgendaScheduler] = None
+    agenda_path: Optional[Path] = args.agenda or (DEFAULT_AGENDA if DEFAULT_AGENDA.exists() else None)
+    if agenda_path is not None:
+        if not agenda_path.exists():
+            logger.warning(f"[AGENDA] File not found: {agenda_path} — running without agenda")
+        else:
+            items = await interpret_agenda(agenda_path.read_text(encoding="utf-8"), openai_client)
+            if items:
+                agenda_scheduler = AgendaScheduler(items)
+                logger.info(f"[AGENDA] Loaded {len(items)} items from {agenda_path.name}:")
+                for i, item in enumerate(items):
+                    logger.info(f"[AGENDA]   {i + 1}. {item.description}")
+            else:
+                logger.warning(f"[AGENDA] No items parsed from {agenda_path} — running without agenda")
+
     email = os.environ.get("GB_EMAIL", "")
     password = os.environ.get("GB_PASSWORD", "")
 
@@ -246,25 +278,59 @@ async def main() -> None:
 
             agent_token = await create_agent_token(room_name)
 
-            # 3. Open headed browser on gradient-bang.com (the only thing on screen now).
-            game_page, game_browser = await launch_game_browser(playwright, email, password)
+            game_launch_fn = None
+            web_launch_fn = None
+            web_browser = None
+            if agenda_scheduler is None:
+                # No agenda: launch game immediately (original behavior).
+                game_page, game_browser = await launch_game_browser(playwright, email, password)
+                game_bot_proc = launch_backend_bot()
+                game_page_for_bot = game_page
+            else:
+                # Agenda active: defer launches until the scheduler reaches the right item.
+                game_page_for_bot = None
 
-            # 4. Launch backend game bot — it handles its own GB login and plays.
-            game_bot_proc = launch_backend_bot()
+                async def game_launch_fn():
+                    nonlocal game_browser, game_bot_proc
+                    page, browser = await launch_game_browser(playwright, email, password)
+                    game_browser = browser
+                    game_bot_proc = launch_backend_bot()
+                    return page
 
-            # 6. Voice co-host joins the streaming room; screenshots from the game browser.
+                async def web_launch_fn():
+                    nonlocal web_browser
+                    browser = await playwright.chromium.launch(
+                        headless=False,
+                        channel="chrome",
+                        args=["--start-maximized"],
+                    )
+                    context = await browser.new_context(viewport={"width": 1280, "height": 800})
+                    page = await context.new_page()
+                    web_browser = browser
+                    logger.info("[BROWSER] Web browser launched for URL browsing.")
+                    return page
+
+            # Voice co-host joins the streaming room.
             logger.info("Starting voice agent...")
-            await run_bot(stream_room_url, agent_token, page=game_page)
+            await run_bot(
+                stream_room_url,
+                agent_token,
+                page=game_page_for_bot,
+                agenda_scheduler=agenda_scheduler,
+                game_launch_fn=game_launch_fn,
+                web_launch_fn=web_launch_fn,
+            )
 
         finally:
             electron_proc.terminate()
             if game_bot_proc is not None:
                 game_bot_proc.terminate()
-            if game_browser is not None:
-                try:
-                    await game_browser.close()
-                except Exception:
-                    pass
+            for browser in (game_browser, web_browser):
+                if browser is not None:
+                    try:
+                        await browser.close()
+                    except Exception:
+                        pass
 
 
 if __name__ == "__main__":

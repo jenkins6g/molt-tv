@@ -2,8 +2,13 @@ import asyncio
 import base64
 import json
 import os
+import random
 import re
+import time
 import uuid
+from collections import deque
+from dataclasses import dataclass
+from typing import Optional
 
 from dotenv import load_dotenv
 from loguru import logger
@@ -25,10 +30,13 @@ from pipecat.workers.llm.llm_worker import LLMWorker
 from pipecat.workers.llm.tool_decorator import tool
 from pipecat.workers.runner import WorkerRunner
 
+from agenda import AgendaScheduler
+
 load_dotenv()
 
 PROACTIVE_INTERVAL = 12
 COOLDOWN_AFTER_ACTIVITY = 8
+MAX_CTX_MESSAGES = 20   # rolling LLM context pairs kept beyond the system prompt
 
 # ── Prompts ────────────────────────────────────────────────────────────────────
 
@@ -42,6 +50,12 @@ HARNESS_SYSTEM_PROMPT = (
     "2. Call the `play_game` tool with your intended action.\n"
     "3. After the game agent reports back, narrate what just happened.\n\n"
     "Never skip the announcement. Never skip the tool call when you intend an action.\n\n"
+    "CHAT AWARENESS:\n"
+    "- Each action tick includes a [MEMORY] block with recent chat and your recent lines.\n"
+    "- Never repeat a phrase or idea already listed under 'You recently said'.\n"
+    "- Vary your openers — avoid starting every response the same way.\n"
+    "- Address viewers by name when natural (e.g. 'Nice one, chat!' or 'Great call, Alice!').\n"
+    "- Keep spoken responses to 1-3 sentences unless explaining strategy.\n\n"
     "At the very start of EVERY spoken response, output one emotion tag: [EMOTION:X] or [EMOTION:X speed:Y].\n"
     "X must be one of: excited, enthusiastic, sarcastic, curious, joking/comedic, surprised, "
     "content, amused, confident, flirtatious.\n"
@@ -58,6 +72,88 @@ GAME_AGENT_SYSTEM_PROMPT = (
     '"report": "Clicked Trade at Station Alpha. Got 200 credits for 50 iron."}\n\n'
     "If you cannot determine what to click, return empty clicks and explain in report."
 )
+
+# ── Chat memory ───────────────────────────────────────────────────────────────
+
+@dataclass
+class _ChatEntry:
+    username: str
+    text: str
+    ts: float
+
+@dataclass
+class _BotEntry:
+    text: str
+    ts: float
+
+
+class ChatMemory:
+    """Rolling window of chat messages and bot utterances for context injection."""
+
+    def __init__(self, chat_window: int = 30, bot_window: int = 10) -> None:
+        self._chat: deque[_ChatEntry] = deque(maxlen=chat_window)
+        self._bot: deque[_BotEntry] = deque(maxlen=bot_window)
+        self._users: dict[str, list[str]] = {}   # username → last 5 messages
+
+    def add_chat(self, username: str, text: str) -> None:
+        self._chat.append(_ChatEntry(username=username, text=text, ts=time.time()))
+        history = self._users.setdefault(username, [])
+        history.append(text)
+        if len(history) > 5:
+            self._users[username] = history[-5:]
+
+    def add_bot(self, text: str) -> None:
+        self._bot.append(_BotEntry(text=text, ts=time.time()))
+
+    def active_users(self, window_sec: float = 300) -> list[str]:
+        cutoff = time.time() - window_sec
+        seen: dict[str, None] = {}
+        for e in self._chat:
+            if e.ts >= cutoff:
+                seen[e.username] = None
+        return list(seen)
+
+    def random_active_user(self) -> Optional[str]:
+        users = self.active_users()
+        return random.choice(users) if users else None
+
+    def context_snapshot(self, window_sec: float = 120) -> str:
+        cutoff = time.time() - window_sec
+        recent_chat = [e for e in self._chat if e.ts >= cutoff]
+        parts: list[str] = []
+        if recent_chat:
+            lines = [f"- {e.username}: {e.text!r}" for e in recent_chat[-10:]]
+            parts.append("Recent chat:\n" + "\n".join(lines))
+        if self._bot:
+            lines = [f"- {e.text!r}" for e in self._bot]
+            parts.append("You recently said:\n" + "\n".join(lines))
+        users = self.active_users()
+        if users:
+            parts.append("Active viewers: " + ", ".join(users))
+        return "\n\n".join(parts)
+
+
+# ── Bot output capture ────────────────────────────────────────────────────────
+
+class BotOutputCapture(FrameProcessor):
+    """Intercepts outgoing text frames and records them in ChatMemory."""
+
+    def __init__(self, memory: ChatMemory) -> None:
+        super().__init__()
+        self._memory = memory
+        self._buffer = ""
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        if direction == FrameDirection.DOWNSTREAM:
+            if isinstance(frame, LLMFullResponseStartFrame):
+                if self._buffer.strip():
+                    self._memory.add_bot(self._buffer.strip())
+                self._buffer = ""
+            elif isinstance(frame, TextFrame):
+                self._buffer += frame.text
+        await self.push_frame(frame, direction)
+
 
 # ── Emotion extractor ──────────────────────────────────────────────────────────
 
@@ -156,9 +252,28 @@ class GameSubagent:
 class HarnessWorker(LLMWorker):
     """Voice co-host multiworker: announces actions, delegates to game subagent, narrates results."""
 
-    def __init__(self, name: str, *, room_url: str, token: str, page, openai_client: AsyncOpenAI):
+    def __init__(
+        self,
+        name: str,
+        *,
+        room_url: str,
+        token: str,
+        page,
+        openai_client: AsyncOpenAI,
+        agenda_scheduler: Optional[AgendaScheduler] = None,
+        game_launch_fn=None,
+        web_launch_fn=None,
+    ):
         self._page = page
         self._last_activity = 0.0
+        self._viewer_count = 0
+        self._agenda_scheduler = agenda_scheduler
+        self._game_launch_fn = game_launch_fn
+        self._web_launch_fn = web_launch_fn
+        self._memory = ChatMemory()
+        self._participant_names: dict[str, str] = {}
+        self._proactive_tick = 0
+        self._last_welcome_time = 0.0
 
         transport = DailyTransport(
             room_url,
@@ -178,14 +293,17 @@ class HarnessWorker(LLMWorker):
         )
 
         context = LLMContext(messages=[{"role": "system", "content": HARNESS_SYSTEM_PROMPT}])
+        self._context = context
         user_agg, assistant_agg = LLMContextAggregatorPair(context)
         emotion_extractor = EmotionExtractor(tts)
+        bot_capture = BotOutputCapture(self._memory)
 
         pipeline = Pipeline([
             transport.input(),
             user_agg,
             llm,
             emotion_extractor,
+            bot_capture,
             tts,
             transport.output(),
             assistant_agg,
@@ -205,12 +323,23 @@ class HarnessWorker(LLMWorker):
         async def on_participant_joined(_transport, participant):
             if participant.get("info", {}).get("isLocal"):
                 return
-            name = participant.get("info", {}).get("userName", "someone")
-            logger.info(f"[DAILY] viewer joined: {name}")
-            self._last_activity = asyncio.get_event_loop().time()
+            name = participant.get("info", {}).get("userName") or ""
+            pid = participant.get("id", "")
+            if pid and name:
+                self._participant_names[pid] = name
+            logger.info(f"[DAILY] viewer joined: {name or '(anonymous)'}")
+            self._viewer_count += 1
+            if not name:
+                return  # don't acknowledge anonymous participants in chat
+            now = asyncio.get_event_loop().time()
+            self._last_activity = now
+            # Only trigger a live response if enough time has passed since the last welcome.
+            run_llm = (now - self._last_welcome_time) > 20.0
+            if run_llm:
+                self._last_welcome_time = now
             await self.queue_frame(LLMMessagesAppendFrame(
-                messages=[{"role": "user", "content": f"Viewer '{name}' just joined. Welcome them!"}],
-                run_llm=True,
+                messages=[{"role": "user", "content": f"Viewer '{name}' just joined the stream."}],
+                run_llm=run_llm,
             ))
 
         @transport.event_handler("on_app_message")
@@ -221,16 +350,19 @@ class HarnessWorker(LLMWorker):
             elif isinstance(message, str):
                 text = message
             if text:
-                logger.info(f"[CHAT] {sender}: {text}")
+                display_name = self._participant_names.get(sender, sender or "chat")
+                logger.info(f"[CHAT] {display_name}: {text}")
+                self._memory.add_chat(display_name, text)
                 self._last_activity = asyncio.get_event_loop().time()
                 await self.queue_frame(LLMMessagesAppendFrame(
-                    messages=[{"role": "user", "content": text}],
+                    messages=[{"role": "user", "content": f"{display_name}: {text}"}],
                     run_llm=True,
                 ))
 
         @transport.event_handler("on_participant_left")
         async def on_participant_left(_transport, participant, reason):
             logger.info(f"[DAILY] left: {participant.get('info', {}).get('userName')}")
+            self._viewer_count = max(0, self._viewer_count - 1)
 
     # ── Multiworker tool: harness → game subagent ──────────────────────────────
 
@@ -245,12 +377,67 @@ class HarnessWorker(LLMWorker):
         result = await self._game_agent.execute(action)
         await params.result_callback(result)
 
+    @tool(cancel_on_interruption=False, timeout=30)
+    async def browse_url(self, params: FunctionCallParams, url: str):
+        """Navigate the browser to a URL. Use for agenda surf/browse items.
+
+        Args:
+            url: The full URL to navigate to, e.g. 'https://www.moltbook.com/'.
+        """
+        if self._page is None:
+            await params.result_callback("No browser page available.")
+            return
+        try:
+            await self._page.goto(url, wait_until="domcontentloaded", timeout=15_000)
+            logger.info(f"[BROWSE] Navigated to {url}")
+            await params.result_callback(f"Navigated to {url}")
+        except Exception as e:
+            logger.warning(f"[BROWSE] Navigation failed: {e}")
+            await params.result_callback(f"Navigation failed: {e}")
+
+    @tool(cancel_on_interruption=False, timeout=10)
+    async def advance_agenda(self, params: FunctionCallParams):
+        """Signal that the current agenda item is complete and advance to the next one.
+        Call this when you judge that the current open-ended agenda item has been fulfilled.
+        """
+        if self._agenda_scheduler is None:
+            await params.result_callback("No agenda active.")
+            return
+        self._agenda_scheduler.signal_advance()
+        logger.info("[AGENDA] LLM called advance_agenda.")
+        await params.result_callback("Agenda advanced to the next item.")
+
     # ── Lifecycle ──────────────────────────────────────────────────────────────
+
+    def _set_page(self, page) -> None:
+        """Update the browser page reference when game launches lazily."""
+        self._page = page
+        self._game_agent._page = page
+        logger.info("[HARNESS] Game page reference updated.")
+
+    async def _inject_agenda(self, message: str) -> None:
+        """Inject an agenda status message into the LLM context."""
+        self._last_activity = asyncio.get_event_loop().time()
+        await self.queue_frame(LLMMessagesAppendFrame(
+            messages=[{"role": "user", "content": message}],
+            run_llm=True,
+        ))
 
     async def on_activated(self, args):
         await super().on_activated(args)
         self._last_activity = asyncio.get_event_loop().time()
         self.create_task(self._proactive_loop(), "proactive-loop")
+        if self._agenda_scheduler:
+            self.create_task(
+                self._agenda_scheduler.run(
+                    self._inject_agenda,
+                    lambda: self._viewer_count,
+                    game_launch_fn=self._game_launch_fn,
+                    on_page_ready=self._set_page,
+                    web_launch_fn=self._web_launch_fn,
+                ),
+                "agenda-scheduler",
+            )
 
     async def _proactive_loop(self):
         await asyncio.sleep(10)
@@ -260,22 +447,62 @@ class HarnessWorker(LLMWorker):
             if elapsed < COOLDOWN_AFTER_ACTIVITY:
                 continue
 
+            # Trim LLM context to prevent unbounded growth (mutate in-place — no setter)
+            msgs = self._context.messages
+            if len(msgs) > MAX_CTX_MESSAGES + 1:
+                keep = [msgs[0]] + msgs[-(MAX_CTX_MESSAGES):]
+                msgs.clear()
+                msgs.extend(keep)
+
+            # Build memory snapshot + optional user-addressing nudge
+            self._proactive_tick += 1
+            snapshot = self._memory.context_snapshot()
+
+            # Build an explicit forbidden-phrases block from the last 3 bot utterances
+            recent_bot = list(self._memory._bot)[-3:]
+            if recent_bot:
+                forbidden_lines = "\n".join(f'  - {e.text!r}' for e in recent_bot)
+                anti_rep = f"\nDO NOT repeat or closely paraphrase any of these:\n{forbidden_lines}\nSay something genuinely different."
+            else:
+                anti_rep = ""
+
+            hint = ""
+            if self._proactive_tick % 3 == 0:
+                user = self._memory.random_active_user()
+                if user:
+                    hint = f"\nConsider addressing {user} directly this turn."
+
+            item = self._agenda_scheduler.current_item() if self._agenda_scheduler else None
+            if item is None or (self._agenda_scheduler and self._agenda_scheduler.is_done()):
+                base_prompt = "This is the current game screen. Decide what to do next, announce it to the stream, then call play_game."
+            elif item.requires_game:
+                base_prompt = "This is the current game screen. Decide what to do next, announce it to the stream, then call play_game."
+            elif item.url:
+                base_prompt = (
+                    f"Your current agenda item is: {item.description}. "
+                    f"Use the browse_url tool to navigate to {item.url} and narrate what you see to the stream. "
+                    f"Do NOT call play_game."
+                )
+            else:
+                base_prompt = (
+                    f"Your current agenda item is: {item.description}. "
+                    f"Do what the agenda asks and engage with the stream. Do NOT call play_game unless the agenda involves the game."
+                )
+            prompt_text = (f"[MEMORY]\n{snapshot}\n\n" if snapshot else "") + base_prompt + anti_rep + hint
+
             if self._page is not None:
                 try:
                     b64 = base64.b64encode(await self._page.screenshot(full_page=False)).decode()
                     content = [
                         {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
-                        {"type": "text", "text": (
-                            "This is the current game screen. "
-                            "Decide what to do next, announce it to the stream, then call play_game."
-                        )},
+                        {"type": "text", "text": prompt_text},
                     ]
-                    logger.info("[PROACTIVE] Sending screenshot to harness.")
+                    logger.info("[PROACTIVE] Sending screenshot with memory context.")
                 except Exception as e:
                     logger.warning(f"[PROACTIVE] Screenshot failed: {e}")
-                    content = "Decide on a game action, announce it, then call play_game."
+                    content = prompt_text
             else:
-                content = "Decide on a game action, announce it, then call play_game."
+                content = prompt_text
 
             self._last_activity = asyncio.get_event_loop().time()
             await self.queue_frame(LLMMessagesAppendFrame(
@@ -286,7 +513,14 @@ class HarnessWorker(LLMWorker):
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
-async def run_bot(room_url: str, token: str, page=None) -> None:
+async def run_bot(
+    room_url: str,
+    token: str,
+    page=None,
+    agenda_scheduler: Optional[AgendaScheduler] = None,
+    game_launch_fn=None,
+    web_launch_fn=None,
+) -> None:
     openai_client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
     worker = HarnessWorker(
@@ -295,6 +529,9 @@ async def run_bot(room_url: str, token: str, page=None) -> None:
         token=token,
         page=page,
         openai_client=openai_client,
+        agenda_scheduler=agenda_scheduler,
+        game_launch_fn=game_launch_fn,
+        web_launch_fn=web_launch_fn,
     )
 
     runner = WorkerRunner()
