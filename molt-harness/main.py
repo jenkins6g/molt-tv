@@ -125,19 +125,30 @@ async def launch_game_browser(playwright, email: str, password: str):
     # The card DOM: <div role="button" aria-label="Select character MoltStreamer, last active ...">
     character_name = os.environ.get("GB_CHARACTER", "MoltStreamer")
 
+    async def hover_then_click(locator):
+        """Move mouse to element once and click at the same coords — avoids re-computing
+        the bounding box between hover and click, which would briefly un-hover the element
+        mid-transition and reset the CSS pointer state."""
+        box = await locator.bounding_box()
+        if box is None:
+            raise RuntimeError("Element has no bounding box")
+        x, y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+        await page.mouse.move(x, y)
+        await page.mouse.click(x, y)
+
     # Primary: aria-label selector — most reliable, matches the actual element
     aria_locator = page.locator(f'[role="button"][aria-label*="Select character {character_name}"]')
     try:
         await aria_locator.first.wait_for(timeout=12_000)
-        await aria_locator.first.click(timeout=5_000)
+        await hover_then_click(aria_locator.first)
         logger.info(f"[BROWSER] Clicked '{character_name}' via aria-label → {page.url}")
     except Exception:
         logger.warning(f"[BROWSER] aria-label selector failed — falling back to text search")
         # Fallback: find the uppercase text span and click its card ancestor
         try:
-            text_el = page.get_by_text(character_name.upper(), exact=True)
+            text_el = page.get_by_text(character_name, exact=True)
             await text_el.first.wait_for(timeout=8_000)
-            await text_el.first.click(timeout=5_000)
+            await hover_then_click(text_el.first)
             logger.info(f"[BROWSER] Clicked '{character_name}' via text fallback → {page.url}")
         except Exception as e:
             logger.warning(f"[BROWSER] Could not click character card: {e}")
