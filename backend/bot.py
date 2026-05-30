@@ -46,7 +46,9 @@ from pipecat.processors.aggregators.llm_response_universal import (  # noqa: E40
 from pipecat.processors.frame_processor import FrameProcessor  # noqa: E402
 from pipecat.transports.daily.transport import DailyParams, DailyTransport  # noqa: E402
 
+from beat_ticker import BeatTicker  # noqa: E402
 from chat_bridge import ChatBridge  # noqa: E402
+from failure_retrieval import FailureRetrievalInjector  # noqa: E402
 from game_processors import (  # noqa: E402
     BotSpeechLogger,
     GameContextInjector,
@@ -57,8 +59,10 @@ from game_processors import (  # noqa: E402
 )
 from game_session import GameSession  # noqa: E402
 from gb_api import login_and_start  # noqa: E402
+from transcript_recorder import TranscriptRecorder  # noqa: E402
 
 from app.agent.mode_parser import ChatModeParser  # noqa: E402
+from app.eval.cekura_client import CekuraClient  # noqa: E402
 from app.memory.failure_store import FailureStore  # noqa: E402
 
 
@@ -189,12 +193,16 @@ async def run_session(
     audio_mode: bool,
     chat_port: int,
     kick_start_after: float,
+    session_id: str | None = None,
 ) -> None:
     logger.info(f"[BOT] mode={'audio' if audio_mode else 'text'} room={room_url}")
 
     session = GameSession(text_mode=not audio_mode)
     system_instruction = session.load_system_prompt()
     logger.info(f"[BOT] loaded system prompt ({len(system_instruction)} chars)")
+
+    session_id = session_id or uuid.uuid4().hex
+    logger.info(f"[BOT] session_id={session_id}")
 
     transport = DailyTransport(
         room_url, room_token, "MoltStreamer",
@@ -211,15 +219,18 @@ async def run_session(
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(context)
 
     store = FailureStore()
+    cekura_client = CekuraClient()
     timing = SpeechTimingState()
     pipeline = Pipeline([
         transport.input(),
         TransportSpeechTimingLogger("transport input", timing),
         user_aggregator,
         GameContextInjector(session.context_store),
+        FailureRetrievalInjector(store=store),
         llm,
         WaitTagFilter(on_wait=timing.reset_for_wait_response),
         ChatModeParser(store=store),
+        TranscriptRecorder(store=store, session_id=session_id),
         BotSpeechLogger(),
         output_stage,
         transport.output(),
@@ -253,6 +264,14 @@ async def run_session(
 
     drain_task = asyncio.create_task(chat_bridge.drain(task))
 
+    beat_ticker = BeatTicker(
+        store=store,
+        cekura_client=cekura_client,
+        context_store=session.context_store,
+        session_id=session_id,
+    )
+    beat_ticker_task = asyncio.create_task(beat_ticker.run())
+
     # ---- transport event handlers -----------------------------------------
 
     async def send_rtvi(msg_type: str, data: dict | None = None) -> None:
@@ -263,6 +282,10 @@ async def run_session(
 
     async def queue_game_turn(text: str) -> None:
         logger.info(f"[GAME TURN → OFFICER] {text}")
+        try:
+            store.record_transcript_turn(session_id, "game", text)
+        except Exception as e:
+            logger.warning(f"[BOT] record_transcript_turn(game) failed: {e}")
         await task.queue_frames([
             LLMMessagesAppendFrame(
                 messages=[{"role": "user", "content": text}],
@@ -310,6 +333,34 @@ async def run_session(
     finally:
         chat_bridge.close()
         drain_task.cancel()
+        beat_ticker.stop()
+        beat_ticker_task.cancel()
+        try:
+            await asyncio.wait_for(beat_ticker_task, timeout=2)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass
+        if os.environ.get("CEKURA_OBSERVABILITY_ENABLED", "true").lower() != "false":
+            try:
+                full_transcript = store.recent_transcript(
+                    since=0.0, limit=10000, session_id=session_id
+                )
+                chat_decisions = store.recent_chat_decisions(limit=200)
+                ok = await asyncio.wait_for(
+                    cekura_client.push_observability(
+                        call_id=session_id,
+                        transcript=full_transcript,
+                        chat_decisions=chat_decisions,
+                        metadata={"audio_mode": audio_mode, "room_url": room_url},
+                    ),
+                    timeout=5.0,
+                )
+                logger.info(f"[CEKURA] observability dump {'ok' if ok else 'failed'}")
+            except (asyncio.TimeoutError, Exception) as e:
+                logger.warning(f"[CEKURA] observability dump error: {e}")
+        try:
+            await cekura_client.close()
+        except Exception:
+            pass
         if sidecar_server is not None:
             sidecar_server.should_exit = True
         if sidecar_task is not None:
@@ -321,6 +372,7 @@ async def run_session(
 
 async def main() -> None:
     args = parse_args()
+    session_id: str | None = None
     if args.room_url:
         try:
             room_url, room_token = resolve_daily_room(args.room_url, args.token)
@@ -330,6 +382,7 @@ async def main() -> None:
     else:
         creds = await login_and_start()
         room_url, room_token = creds.room_url, creds.room_token
+        session_id = getattr(creds, "session_id", None)
 
     await run_session(
         room_url=room_url,
@@ -337,6 +390,7 @@ async def main() -> None:
         audio_mode=args.audio,
         chat_port=args.chat_port if args.chat_port > 0 else 0,
         kick_start_after=args.kick_start_after,
+        session_id=session_id,
     )
 
 
