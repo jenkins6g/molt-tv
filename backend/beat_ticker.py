@@ -13,8 +13,8 @@ metric scores populate asynchronously. So every BEAT_INTERVAL_SECONDS
    session is therefore "pending").
 4. Persists a ``beats`` row capturing this snapshot.
 5. On a fail verdict with a NEW assistant utterance (deduped against the
-   last tagged one), tags the failure with Bedrock Haiku, embeds the
-   offending utterance with Bedrock Titan, and writes to FAISS via
+   last tagged one), tags the failure with OpenRouter, embeds the
+   offending utterance with sentence-transformers, and writes to FAISS via
    ``FailureStore.add_failure``. The next LLM turn picks it up through
    ``FailureRetrievalInjector``.
 

@@ -8,10 +8,8 @@ load_dotenv(override=True)
 
 @dataclass(frozen=True)
 class Settings:
-    aws_region: str
-    bedrock_embed_model: str
-    bedrock_tagger_model: str
-    s3_bucket: str
+    openrouter_api_key: str
+    openrouter_base_url: str
 
     nemotron_llm_url: str
     nemotron_llm_api_key: str
@@ -39,10 +37,8 @@ class Settings:
 def load() -> Settings:
     g = os.environ.get
     return Settings(
-        aws_region=g("AWS_REGION", "us-east-1"),
-        bedrock_embed_model=g("BEDROCK_EMBED_MODEL", "amazon.titan-embed-text-v2:0"),
-        bedrock_tagger_model=g("BEDROCK_TAGGER_MODEL", "anthropic.claude-haiku-4-5-20251001-v1:0"),
-        s3_bucket=g("S3_BUCKET", "civicpilot-artifacts"),
+        openrouter_api_key=g("OPENROUTER_API_KEY", ""),
+        openrouter_base_url=g("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
         nemotron_llm_url=g("NEMOTRON_LLM_URL", ""),
         nemotron_llm_api_key=g("NEMOTRON_LLM_API_KEY", "EMPTY"),
         nemotron_llm_model=g("NEMOTRON_LLM_MODEL", "nvidia/nemotron-3-super"),

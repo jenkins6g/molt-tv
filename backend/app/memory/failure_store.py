@@ -86,7 +86,7 @@ CREATE INDEX IF NOT EXISTS idx_beats_session ON beats(session_id);
 CREATE INDEX IF NOT EXISTS idx_beats_started ON beats(started_at);
 """
 
-DIM = 1024
+DIM = 384
 
 
 @dataclass

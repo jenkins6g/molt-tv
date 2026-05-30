@@ -205,7 +205,7 @@ async def run_session(
     logger.info(f"[BOT] session_id={session_id}")
 
     transport = DailyTransport(
-        room_url, room_token, "MoltStreamer",
+        room_url, room_token, os.environ.get("GB_CHARACTER", "MoltStreamer"),
         params=DailyParams(
             audio_in_enabled=False,
             audio_out_enabled=audio_mode,
@@ -314,11 +314,14 @@ async def run_session(
                 "warp power."
             )
 
+    # Characters the Ship AI emits as loading/progress indicators — not real utterances.
+    _SPINNER_CHARS = {"◐", "◓", "◑", "◒", "⟳", "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
     @transport.event_handler("on_app_message")
     async def on_app_message(_transport, message, sender):
         logger.debug(f"[APP MESSAGE][{sender}] {message}")
         text = session.handle_app_message(message)
-        if text:
+        if text and text.strip() not in _SPINNER_CHARS:
             await queue_game_turn(text)
 
     @transport.event_handler("on_client_disconnected")

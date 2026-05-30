@@ -1,8 +1,8 @@
 """Retrieves similar past failures and injects them as few-shots before the LLM call.
 
 Closes the read-side of the auto-improvement loop. The write side lives in
-``beat_ticker.py``: it scores beats with Cekura, tags failures with Haiku,
-embeds them with Titan, and stores them in FailureStore. This processor
+``beat_ticker.py``: it scores beats with Cekura, tags failures with OpenRouter,
+embeds them with sentence-transformers, and stores them in FailureStore. This processor
 queries FailureStore on every LLM turn for the top-k most semantically
 similar past failures and prepends them to the context as a system message
 right before the latest user message — the strongest steering position
@@ -43,6 +43,20 @@ class FailureRetrievalInjector(FrameProcessor):
         self._store = store
         self._k = k
         self._min_score = min_score
+        self._log_memory(store)
+
+    @staticmethod
+    def _log_memory(store) -> None:
+        n = store._index.ntotal
+        if n == 0:
+            logger.info("[MEMORY] FAISS index empty — no past failures loaded")
+            return
+        logger.info(f"[MEMORY] {n} past failure(s) loaded from FAISS:")
+        rows = store._db.execute(
+            "SELECT failure_mode, utterance, wrong_output FROM failures ORDER BY created_at DESC LIMIT 10"
+        ).fetchall()
+        for mode, utterance, wrong in rows:
+            logger.info(f"  [{mode}] when='{utterance}' → avoid='{wrong}'")
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -69,7 +83,9 @@ class FailureRetrievalInjector(FrameProcessor):
             return
 
         few_shot = self._format(results)
-        logger.info(f"[RETRIEVAL] injected {len(results)} past failures")
+        logger.info(f"[RETRIEVAL] injected {len(results)} past failures:")
+        for f, score in results:
+            logger.info(f"  [{f.failure_mode}] score={score:.2f} — avoid: {f.wrong_output!r}")
         messages.insert(last_user_idx, {"role": "system", "content": few_shot})
 
         enriched = LLMContext(
