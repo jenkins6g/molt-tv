@@ -48,51 +48,49 @@ async def main() -> None:
         env={**os.environ},
     )
 
-    async with async_playwright() as playwright:
-        # Wait for Electron's CDP endpoint to become available
-        browser = None
-        for attempt in range(15):
-            await asyncio.sleep(1)
-            try:
-                browser = await playwright.chromium.connect_over_cdp(
-                    f"http://localhost:{CDP_PORT}"
-                )
-                break
-            except Exception:
-                logger.debug(f"CDP not ready yet (attempt {attempt + 1})...")
-
-        if browser is None:
-            electron_proc.terminate()
-            raise RuntimeError("Could not connect to Electron via CDP")
-
-        # Find the renderer window (not the devtools page)
-        context = browser.contexts[0]
-        page = next(
-            (p for p in context.pages if "index.html" in p.url or p.url == "about:blank"),
-            context.pages[0],
-        )
-
-        logger.info("Waiting for Daily room to be created...")
-        await page.wait_for_selector("#room-url", timeout=15_000)
-        await page.wait_for_function(
-            "document.getElementById('room-url').value !== ''",
-            timeout=15_000,
-        )
-        room_url = await page.input_value("#room-url")
-        room_name = room_url.rstrip("/").split("/")[-1]
-        logger.info(f"Room ready: {room_url}")
-
-        logger.info("Starting broadcast...")
-        await page.wait_for_selector("#start-btn:not([disabled])", timeout=10_000)
-        await page.click("#start-btn")
-        logger.info("Broadcast started.")
-
-    logger.info("Minting agent owner token...")
-    agent_token = await create_agent_token(room_name)
-
-    logger.info("Starting voice agent...")
     try:
-        await run_bot(room_url, agent_token)
+        async with async_playwright() as playwright:
+            browser = None
+            for attempt in range(15):
+                await asyncio.sleep(1)
+                try:
+                    browser = await playwright.chromium.connect_over_cdp(
+                        f"http://localhost:{CDP_PORT}"
+                    )
+                    break
+                except Exception:
+                    logger.debug(f"CDP not ready yet (attempt {attempt + 1})...")
+
+            if browser is None:
+                raise RuntimeError("Could not connect to Electron via CDP")
+
+            context = browser.contexts[0]
+            page = next(
+                (p for p in context.pages if "index.html" in p.url or p.url == "about:blank"),
+                context.pages[0],
+            )
+
+            logger.info("Waiting for Daily room to be created...")
+            await page.wait_for_selector("#room-url", timeout=15_000)
+            await page.wait_for_function(
+                "document.getElementById('room-url').value !== ''",
+                timeout=15_000,
+            )
+            room_url = await page.input_value("#room-url")
+            room_name = room_url.rstrip("/").split("/")[-1]
+            logger.info(f"Room ready: {room_url}")
+
+            logger.info("Starting broadcast...")
+            await page.wait_for_selector("#start-btn:not([disabled])", timeout=10_000)
+            await page.click("#start-btn")
+            logger.info("Broadcast started.")
+
+            logger.info("Minting agent owner token...")
+            agent_token = await create_agent_token(room_name)
+
+            # Keep playwright alive so the bot can screenshot the preview
+            logger.info("Starting voice agent...")
+            await run_bot(room_url, agent_token, page=page)
     finally:
         electron_proc.terminate()
 
