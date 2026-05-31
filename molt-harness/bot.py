@@ -14,8 +14,10 @@ from dotenv import load_dotenv
 from loguru import logger
 from openai import AsyncOpenAI
 from pipecat.frames.frames import (
+    LLMContextFrame,
     LLMFullResponseStartFrame,
     LLMMessagesAppendFrame,
+    OutputTransportMessageUrgentFrame,
     TextFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
@@ -50,7 +52,12 @@ HARNESS_SYSTEM_PROMPT = (
     "WHEN PLAYING GRADIENT BANG:\n"
     "- Decide the next game action, announce it with energy, then call `play_game`.\n"
     "- After the game agent reports back, narrate what happened in 1-2 punchy sentences.\n"
-    "- Never skip the announcement. Never skip the tool call when you intend a game action.\n\n"
+    "- Never skip the announcement. Never skip the tool call when you intend a game action.\n"
+    "- If the same action fails or makes no progress 2 times in a row, STOP trying it. "
+    "Try something completely different — explore, trade, jump to a new sector. "
+    "Don't get stuck in a loop.\n"
+    "- If play_game returns a message starting with GIVE_UP:, the game agent exhausted "
+    "its attempts. Acknowledge it briefly to chat and pick a completely different action.\n\n"
     "WHEN BROWSING A WEBSITE:\n"
     "- Call `browse_url` to navigate, then react to what you see like a streamer reacting live.\n"
     "- Comment on the layout, the content, funny/weird things you notice. Keep it natural.\n\n"
@@ -202,16 +209,48 @@ class EmotionExtractor(FrameProcessor):
 # ── Game subagent (vision + Playwright) ───────────────────────────────────────
 
 class GameSubagent:
-    """Receives high-level actions from the harness, executes them via Playwright."""
+    """Receives high-level actions from the harness, executes them via Playwright.
+
+    Tracks consecutive failures on the same action. After MAX_RETRIES attempts
+    with no visible progress, gives up and tells the harness to try something else.
+    """
+
+    MAX_RETRIES = 2
 
     def __init__(self, page, openai_client: AsyncOpenAI):
         self._page = page
         self._client = openai_client
         self._history: list[dict] = [{"role": "system", "content": GAME_AGENT_SYSTEM_PROMPT}]
+        self._last_action: str = ""
+        self._fail_streak: int = 0
+
+    def _is_failure(self, report: str, clicks: list) -> bool:
+        """A result counts as failure if the agent found nothing to click or said it couldn't proceed."""
+        if not clicks:
+            return True
+        no_op_phrases = (
+            "no visible", "cannot", "unable", "not found", "no button",
+            "does not display", "no option", "no menu", "not available",
+            "no relevant", "no ui", "no direct",
+        )
+        return any(p in report.lower() for p in no_op_phrases)
 
     async def execute(self, action: str) -> str:
         if self._page is None:
             return "No game page available."
+
+        # Track consecutive failures on the same action
+        if action == self._last_action:
+            self._fail_streak += 1
+        else:
+            self._fail_streak = 0
+            self._last_action = action
+
+        if self._fail_streak >= self.MAX_RETRIES:
+            self._fail_streak = 0
+            self._last_action = ""
+            logger.warning(f"[GAME AGENT] Giving up on '{action[:60]}' after {self.MAX_RETRIES} failures — telling harness to try something different")
+            return f"GIVE_UP: Could not complete '{action}' after {self.MAX_RETRIES} attempts. No relevant UI found. Try a completely different action."
 
         try:
             b64 = base64.b64encode(await self._page.screenshot(full_page=False)).decode()
@@ -240,7 +279,8 @@ class GameSubagent:
             logger.warning(f"[GAME AGENT] LLM call failed: {e}")
             return f"Could not plan action: {e}"
 
-        for click in plan.get("clicks", []):
+        clicks = plan.get("clicks", [])
+        for click in clicks:
             try:
                 await self._page.mouse.click(click["x"], click["y"])
                 logger.info(f"[GAME AGENT] Clicked ({click['x']}, {click['y']}): {click.get('description', '')}")
@@ -251,7 +291,75 @@ class GameSubagent:
         report = plan.get("report", "Action executed.")
         logger.info(f"[SUBAGENT → HARNESS] {report}")
         self._history.append({"role": "assistant", "content": raw})
+
+        if self._is_failure(report, clicks):
+            self._fail_streak += 1
+        else:
+            self._fail_streak = 0
+            self._last_action = ""
+
         return report
+
+
+# ── Context sanitizer ─────────────────────────────────────────────────────────
+
+class ContextSanitizer(FrameProcessor):
+    """Strips orphaned tool/developer messages from the LLM context before sending.
+
+    Cleans both the frame copy AND the source context object so the aggregator
+    doesn't keep regenerating dirty frames from stale state.
+    """
+
+    def __init__(self, context: LLMContext):
+        super().__init__()
+        self._context = context
+
+    @staticmethod
+    def _clean(messages: list) -> list:
+        clean = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                clean.append(msg)
+                continue
+            role = msg.get("role")
+            if role == "tool":
+                prev = next(
+                    (m for m in reversed(clean)
+                     if isinstance(m, dict) and m.get("role") not in ("system", "developer")),
+                    None,
+                )
+                if prev and prev.get("role") == "assistant" and prev.get("tool_calls"):
+                    clean.append(msg)
+                else:
+                    logger.debug(f"[SANITIZER] Dropped orphaned tool msg: {str(msg)[:80]}")
+            else:
+                clean.append(msg)
+        return clean
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        if not isinstance(frame, LLMContextFrame):
+            await self.push_frame(frame, direction)
+            return
+
+        messages = list(frame.context.get_messages())
+        clean = self._clean(messages)
+
+        if len(clean) != len(messages):
+            # Patch the source context so future frames from the aggregator are also clean
+            try:
+                self._context.messages.clear()
+                self._context.messages.extend(clean)
+            except Exception:
+                pass
+            sanitized = LLMContext(
+                messages=clean,
+                tools=frame.context.tools,
+                tool_choice=frame.context.tool_choice,
+            )
+            await self.push_frame(LLMContextFrame(sanitized), direction)
+        else:
+            await self.push_frame(frame, direction)
 
 
 # ── Harness worker (LLMWorker multiworker) ────────────────────────────────────
@@ -308,6 +416,7 @@ class HarnessWorker(LLMWorker):
         pipeline = Pipeline([
             transport.input(),
             user_agg,
+            ContextSanitizer(context),
             llm,
             emotion_extractor,
             bot_capture,
