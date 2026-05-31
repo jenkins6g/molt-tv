@@ -596,16 +596,12 @@ class HarnessWorker(LLMWorker):
             elif item.requires_game:
                 base_prompt = "This is the current game screen. Decide what to do next, announce it to the stream, then call play_game."
             elif item.url:
-                base_prompt = (
-                    f"Your current agenda item is: {item.description}. "
-                    f"Use the browse_url tool to navigate to {item.url} and narrate what you see to the stream. "
-                    f"Do NOT call play_game."
-                )
+                # Don't repeat the specific agenda description here — it can be stale if this
+                # tick fires at the same time as an agenda transition. The [AGENDA X/X] message
+                # already told the LLM what to do; just nudge it to engage.
+                base_prompt = "Engage with what's on screen. Use browse_url if you need to navigate somewhere. Do NOT call play_game."
             else:
-                base_prompt = (
-                    f"Your current agenda item is: {item.description}. "
-                    f"Do what the agenda asks and engage with the stream. Do NOT call play_game unless the agenda involves the game."
-                )
+                base_prompt = "Engage with the stream."
             prompt_text = (f"[MEMORY]\n{snapshot}\n\n" if snapshot else "") + base_prompt + anti_rep + hint
 
             if self._page is not None:
